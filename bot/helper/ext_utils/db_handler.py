@@ -3,8 +3,10 @@ from aiofiles.os import path as aiopath, makedirs
 from aiofiles import open as aiopen
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
+from dotenv import dotenv_values
 
 from bot import DATABASE_URL, user_data, rss_dict, LOGGER, bot_id, config_dict, aria2_options, qbit_options, bot_loop
+
 
 class DbManger:
     def __init__(self):
@@ -12,7 +14,6 @@ class DbManger:
         self.__db = None
         self.__conn = None
         self.__connect()
-
 
     def __connect(self):
         try:
@@ -36,27 +37,49 @@ class DbManger:
         # User Data
         if await self.__db.users.find_one():
             rows = self.__db.users.find({})
-            # return a dict ==> {_id, is_sudo, is_auth, as_doc, thumb, yt_ql, media_group, equal_splits, split_size}
+            # return a dict ==> {_id, is_sudo, is_auth, as_doc, thumb, yt_opt, media_group, equal_splits, split_size, rclone, rclone_path, token_pickle, gdrive_id, leech_dest, lperfix, lprefix, excluded_extensions, user_leech, index_url, index_url, default_upload}
             async for row in rows:
                 uid = row['_id']
                 del row['_id']
-                path = f"Thumbnails/{uid}.jpg"
+                thumb_path = f'Thumbnails/{uid}.jpg'
+                rclone_config_path = f'rclone/{uid}.conf'
+                token_path = f'tokens/{uid}.pickle'
                 if row.get('thumb'):
                     if not await aiopath.exists('Thumbnails'):
                         await makedirs('Thumbnails')
-                    async with aiopen(path, 'wb+') as f:
+                    async with aiopen(thumb_path, 'wb+') as f:
                         await f.write(row['thumb'])
-                    row['thumb'] = path
+                    row['thumb'] = thumb_path
+                if row.get('rclone_config'):
+                    if not await aiopath.exists('rclone'):
+                        await makedirs('rclone')
+                    async with aiopen(rclone_config_path, 'wb+') as f:
+                        await f.write(row['rclone_config'])
+                    row['rclone_config'] = rclone_config_path
+                if row.get('token_pickle'):
+                    if not await aiopath.exists('tokens'):
+                        await makedirs('tokens')
+                    async with aiopen(token_path, 'wb+') as f:
+                        await f.write(row['token_pickle'])
+                    row['token_pickle'] = token_path
                 user_data[uid] = row
             LOGGER.info("Users data has been imported from Database")
         # Rss Data
         if await self.__db.rss[bot_id].find_one():
-            rows = self.__db.rss[bot_id].find({})  # return a dict ==> {_id, title: {link, last_feed, last_name, inf, exf, command, paused}
+            # return a dict ==> {_id, title: {link, last_feed, last_name, inf, exf, command, paused}
+            rows = self.__db.rss[bot_id].find({})
             async for row in rows:
                 user_id = row['_id']
                 del row['_id']
                 rss_dict[user_id] = row
             LOGGER.info("Rss data has been imported from Database.")
+        self.__conn.close
+
+    async def update_deploy_config(self):
+        if self.__err:
+            return
+        current_config = dict(dotenv_values('config.env'))
+        await self.__db.settings.deployConfig.replace_one({'_id': bot_id}, current_config, upsert=True)
         self.__conn.close
 
     async def update_config(self, dict_):
@@ -87,7 +110,10 @@ class DbManger:
             pf_bin = ''
         path = path.replace('.', '__')
         await self.__db.settings.files.update_one({'_id': bot_id}, {'$set': {path: pf_bin}}, upsert=True)
-        self.__conn.close
+        if path == 'config.env':
+            await self.update_deploy_config()
+        else:
+            self.__conn.close
 
     async def update_user_data(self, user_id):
         if self.__err:
@@ -95,18 +121,22 @@ class DbManger:
         data = user_data[user_id]
         if data.get('thumb'):
             del data['thumb']
+        if data.get('rclone_config'):
+            del data['rclone_config']
+        if data.get('token_pickle'):
+            del data['token_pickle']
         await self.__db.users.replace_one({'_id': user_id}, data, upsert=True)
         self.__conn.close
 
-    async def update_thumb(self, user_id, path=None):
+    async def update_user_doc(self, user_id, key, path=''):
         if self.__err:
             return
-        if path is not None:
-            async with aiopen(path, 'rb+') as image:
-                image_bin = await image.read()
+        if path:
+            async with aiopen(path, 'rb+') as doc:
+                doc_bin = await doc.read()
         else:
-            image_bin = ''
-        await self.__db.users.update_one({'_id': user_id}, {'$set': {'thumb': image_bin}}, upsert=True)
+            doc_bin = ''
+        await self.__db.users.update_one({'_id': user_id}, {'$set': {key: doc_bin}}, upsert=True)
         self.__conn.close
 
     async def rss_update_all(self):
@@ -145,24 +175,27 @@ class DbManger:
         if self.__err:
             return notifier_dict
         if await self.__db.tasks[bot_id].find_one():
-            rows = self.__db.tasks[bot_id].find({})  # return a dict ==> {_id, cid, tag}
+            # return a dict ==> {_id, cid, tag}
+            rows = self.__db.tasks[bot_id].find({})
             async for row in rows:
                 if row['cid'] in list(notifier_dict.keys()):
                     if row['tag'] in list(notifier_dict[row['cid']]):
-                        notifier_dict[row['cid']][row['tag']].append(row['_id'])
+                        notifier_dict[row['cid']][row['tag']].append(
+                            row['_id'])
                     else:
                         notifier_dict[row['cid']][row['tag']] = [row['_id']]
                 else:
                     notifier_dict[row['cid']] = {row['tag']: [row['_id']]}
         await self.__db.tasks[bot_id].drop()
         self.__conn.close
-        return notifier_dict # return a dict ==> {cid: {tag: [_id, _id, ...]}}
+        return notifier_dict  # return a dict ==> {cid: {tag: [_id, _id, ...]}}
 
     async def trunc_table(self, name):
         if self.__err:
             return
         await self.__db[name][bot_id].drop()
         self.__conn.close
+
 
 if DATABASE_URL:
     bot_loop.run_until_complete(DbManger().db_load())

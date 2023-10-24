@@ -6,12 +6,12 @@ from bot import bot, LOGGER
 from bot.helper.telegram_helper.message_utils import auto_delete_message, sendMessage
 from bot.helper.telegram_helper.filters import CustomFilters
 from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
-from bot.helper.ext_utils.bot_utils import is_gdrive_link, sync_to_async, new_thread
+from bot.helper.mirror_utils.gdrive_utlis.delete import gdDelete
+from bot.helper.ext_utils.bot_utils import is_gdrive_link, sync_to_async, new_task
 
 
-@new_thread
-async def deletefile(client, message):
+@new_task
+async def deletefile(_, message):
     args = message.text.split()
     if len(args) > 1:
         link = args[1]
@@ -21,12 +21,12 @@ async def deletefile(client, message):
         link = ''
     if is_gdrive_link(link):
         LOGGER.info(link)
-        drive = GoogleDriveHelper()
-        msg = await sync_to_async(drive.deletefile, link)
+        msg = await sync_to_async(gdDelete().deletefile, link, message.from_user.id)
     else:
         msg = 'Send Gdrive link along with command or by replying to the link by command'
     reply_message = await sendMessage(message, msg)
     await auto_delete_message(message, reply_message)
 
 
-bot.add_handler(MessageHandler(deletefile, filters=command(BotCommands.DeleteCommand) & CustomFilters.authorized))
+bot.add_handler(MessageHandler(deletefile, filters=command(
+    BotCommands.DeleteCommand) & CustomFilters.authorized))

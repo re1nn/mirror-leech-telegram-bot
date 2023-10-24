@@ -5,19 +5,19 @@ from io import BytesIO
 
 from bot import LOGGER, bot
 from bot.helper.telegram_helper.message_utils import sendMessage, sendFile
-from bot.helper.ext_utils.bot_utils import cmd_exec, new_thread
+from bot.helper.ext_utils.bot_utils import cmd_exec, new_task
 from bot.helper.telegram_helper.filters import CustomFilters
 from bot.helper.telegram_helper.bot_commands import BotCommands
 
 
-@new_thread
-async def shell(client, message):
+@new_task
+async def shell(_, message):
     cmd = message.text.split(maxsplit=1)
     if len(cmd) == 1:
         await sendMessage(message, 'No command to execute was given.')
         return
     cmd = cmd[1]
-    stdout, stderr, returncode = await cmd_exec(cmd, shell=True)
+    stdout, stderr, _ = await cmd_exec(cmd, shell=True)
     reply = ''
     if len(stdout) != 0:
         reply += f"*Stdout*\n<code>{stdout}</code>\n"
@@ -35,5 +35,7 @@ async def shell(client, message):
         await sendMessage(message, 'No Reply')
 
 
-bot.add_handler(MessageHandler(shell, filters=command(BotCommands.ShellCommand) & CustomFilters.owner))
-bot.add_handler(EditedMessageHandler(shell, filters=command(BotCommands.ShellCommand) & CustomFilters.owner))
+bot.add_handler(MessageHandler(shell, filters=command(
+    BotCommands.ShellCommand) & CustomFilters.owner))
+bot.add_handler(EditedMessageHandler(shell, filters=command(
+    BotCommands.ShellCommand) & CustomFilters.owner))
