@@ -1,3 +1,4 @@
+from dotenv import load_dotenv, dotenv_values
 from logging import (
     FileHandler,
     StreamHandler,
@@ -5,17 +6,21 @@ from logging import (
     basicConfig,
     error as log_error,
     info as log_info,
+    getLogger,
+    ERROR,
 )
-from os import path as ospath, environ, remove
+from os import path, environ, remove
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
 from subprocess import run as srun
-from dotenv import load_dotenv, dotenv_values
-from pymongo import MongoClient
 
-if ospath.exists("log.txt"):
+getLogger("pymongo").setLevel(ERROR)
+
+if path.exists("log.txt"):
     with open("log.txt", "r+") as f:
         f.truncate(0)
 
-if ospath.exists("rlog.txt"):
+if path.exists("rlog.txt"):
     remove("rlog.txt")
 
 basicConfig(
@@ -30,7 +35,7 @@ try:
     if bool(environ.get("_____REMOVE_THIS_LINE_____")):
         log_error("The README.md file there to be read! Exiting now!")
         exit(1)
-except:
+except Exception:
     pass
 
 BOT_TOKEN = environ.get("BOT_TOKEN", "")
@@ -46,7 +51,7 @@ if len(DATABASE_URL) == 0:
 
 if DATABASE_URL is not None:
     try:
-        conn = MongoClient(DATABASE_URL)
+        conn = MongoClient(DATABASE_URL, server_api=ServerApi("1"))
         db = conn.mltb
         old_config = db.settings.deployConfig.find_one({"_id": bot_id})
         config_dict = db.settings.config.find_one({"_id": bot_id})
@@ -72,7 +77,7 @@ if len(UPSTREAM_BRANCH) == 0:
     UPSTREAM_BRANCH = "master"
 
 if UPSTREAM_REPO is not None:
-    if ospath.exists(".git"):
+    if path.exists(".git"):
         srun(["rm", "-rf", ".git"])
 
     update = srun(

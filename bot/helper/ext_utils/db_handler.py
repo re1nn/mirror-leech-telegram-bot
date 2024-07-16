@@ -1,8 +1,9 @@
-from aiofiles.os import path as aiopath, makedirs
 from aiofiles import open as aiopen
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import PyMongoError
+from aiofiles.os import path as aiopath, makedirs
 from dotenv import dotenv_values
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.server_api import ServerApi
+from pymongo.errors import PyMongoError
 
 from bot import (
     DATABASE_URL,
@@ -13,11 +14,10 @@ from bot import (
     config_dict,
     aria2_options,
     qbit_options,
-    bot_loop,
 )
 
 
-class DbManger:
+class DbManager:
     def __init__(self):
         self._err = False
         self._db = None
@@ -26,7 +26,7 @@ class DbManger:
 
     def _connect(self):
         try:
-            self._conn = AsyncIOMotorClient(DATABASE_URL)
+            self._conn = AsyncIOMotorClient(DATABASE_URL, server_api=ServerApi("1"))
             self._db = self._conn.mltb
         except PyMongoError as e:
             LOGGER.error(f"Error in DB connection: {e}")
@@ -37,8 +37,8 @@ class DbManger:
             return
         # Save bot settings
         try:
-            await self._db.settings.config.update_one(
-                {"_id": bot_id}, {"$set": config_dict}, upsert=True
+            await self._db.settings.config.replace_one(
+                {"_id": bot_id}, config_dict, upsert=True
             )
         except Exception as e:
             LOGGER.error(f"DataBase Collection Error: {e}")
@@ -51,8 +51,13 @@ class DbManger:
             )
         # Save qbittorrent options
         if await self._db.settings.qbittorrent.find_one({"_id": bot_id}) is None:
-            await self._db.settings.qbittorrent.update_one(
-                {"_id": bot_id}, {"$set": qbit_options}, upsert=True
+            await self.save_qbit_settings()
+        # Save nzb config
+        if await self._db.settings.nzb.find_one({"_id": bot_id}) is None:
+            async with aiopen("sabnzbd/SABnzbd.ini", "rb+") as pf:
+                nzb_conf = await pf.read()
+            await self._db.settings.nzb.update_one(
+                {"_id": bot_id}, {"$set": {"SABnzbd__ini": nzb_conf}}, upsert=True
             )
         # User Data
         if await self._db.users.find_one():
@@ -128,6 +133,14 @@ class DbManger:
         )
         self._conn.close
 
+    async def save_qbit_settings(self):
+        if self._err:
+            return
+        await self._db.settings.qbittorrent.replace_one(
+            {"_id": bot_id}, qbit_options, upsert=True
+        )
+        self._conn.close
+
     async def update_private_file(self, path):
         if self._err:
             return
@@ -136,7 +149,7 @@ class DbManger:
                 pf_bin = await pf.read()
         else:
             pf_bin = ""
-        path = path.replace(".", "_")
+        path = path.replace(".", "__")
         await self._db.settings.files.update_one(
             {"_id": bot_id}, {"$set": {path: pf_bin}}, upsert=True
         )
@@ -145,10 +158,17 @@ class DbManger:
         else:
             self._conn.close
 
+    async def update_nzb_config(self):
+        async with aiopen("sabnzbd/SABnzbd.ini", "rb+") as pf:
+            nzb_conf = await pf.read()
+        await self._db.settings.nzb.replace_one(
+            {"_id": bot_id}, {"SABnzbd__ini": nzb_conf}, upsert=True
+        )
+
     async def update_user_data(self, user_id):
         if self._err:
             return
-        data = user_data[user_id]
+        data = user_data.get(user_id, {})
         if data.get("thumb"):
             del data["thumb"]
         if data.get("rclone_config"):
@@ -230,7 +250,3 @@ class DbManger:
             return
         await self._db[name][bot_id].drop()
         self._conn.close
-
-
-if DATABASE_URL:
-    bot_loop.run_until_complete(DbManger().db_load())

@@ -1,16 +1,22 @@
-from feedparser import parse as feedparse
-from pyrogram.handlers import MessageHandler, CallbackQueryHandler
-from pyrogram.filters import command, regex, create
+from httpx import AsyncClient
+from apscheduler.triggers.interval import IntervalTrigger
 from asyncio import Lock, sleep
 from datetime import datetime, timedelta
-from time import time
+from feedparser import parse as feedparse
 from functools import partial
-from aiohttp import ClientSession
-from apscheduler.triggers.interval import IntervalTrigger
-from re import split as re_split
 from io import BytesIO
+from pyrogram.filters import command, regex, create
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from time import time
 
 from bot import scheduler, rss_dict, LOGGER, DATABASE_URL, config_dict, bot
+from bot.helper.ext_utils.bot_utils import new_thread, arg_parser
+from bot.helper.ext_utils.db_handler import DbManager
+from bot.helper.ext_utils.exceptions import RssShutdownException
+from bot.helper.ext_utils.help_messages import RSS_HELP_MESSAGE
+from bot.helper.telegram_helper.bot_commands import BotCommands
+from bot.helper.telegram_helper.button_build import ButtonMaker
+from bot.helper.telegram_helper.filters import CustomFilters
 from bot.helper.telegram_helper.message_utils import (
     sendMessage,
     editMessage,
@@ -18,13 +24,6 @@ from bot.helper.telegram_helper.message_utils import (
     sendFile,
     deleteMessage,
 )
-from bot.helper.telegram_helper.filters import CustomFilters
-from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot.helper.ext_utils.db_handler import DbManger
-from bot.helper.telegram_helper.button_build import ButtonMaker
-from bot.helper.ext_utils.bot_utils import new_thread
-from bot.helper.ext_utils.exceptions import RssShutdownException
-from bot.helper.ext_utils.help_messages import RSS_HELP_MESSAGE
 
 rss_dict_lock = Lock()
 handler_dict = {}
@@ -93,18 +92,20 @@ async def rssSub(_, message, pre_event):
         if feed_link.startswith(("-inf", "-exf", "-c")):
             await sendMessage(
                 message,
-                f"Wrong input in line {index}! Re-add only the mentioned line correctly! Read the example!",
+                f"Wrong input in line {index}! Add Title! Read the example!",
             )
             continue
         inf_lists = []
         exf_lists = []
         if len(args) > 2:
-            arg = item.split(" -c ", 1)
-            cmd = re_split(" -inf | -exf ", arg[1])[0].strip() if len(arg) > 1 else None
-            arg = item.split(" -inf ", 1)
-            inf = re_split(" -c | -exf ", arg[1])[0].strip() if len(arg) > 1 else None
-            arg = item.split(" -exf ", 1)
-            exf = re_split(" -c | -inf ", arg[1])[0].strip() if len(arg) > 1 else None
+            arg_base = {"-c": None, "-inf": None, "-exf": None, "-stv": None}
+            arg_parser(args[2:], arg_base)
+            cmd = arg_base["-c"]
+            inf = arg_base["-inf"]
+            exf = arg_base["-exf"]
+            stv = arg_base["-stv"]
+            if stv is not None:
+                stv = stv.lower() == "true"
             if inf is not None:
                 filters_list = inf.split("|")
                 for x in filters_list:
@@ -119,10 +120,11 @@ async def rssSub(_, message, pre_event):
             inf = None
             exf = None
             cmd = None
+            stv = False
         try:
-            async with ClientSession(trust_env=True) as session:
-                async with session.get(feed_link) as res:
-                    html = await res.text()
+            async with AsyncClient(verify=False) as client:
+                res = await client.get(feed_link)
+            html = res.text
             rss_d = feedparse(html)
             last_title = rss_d.entries[0]["title"]
             msg += "<b>Subscribed!</b>"
@@ -137,9 +139,7 @@ async def rssSub(_, message, pre_event):
                 last_link = rss_d.entries[0]["link"]
             msg += f"\nLink: <code>{last_link}</code>"
             msg += f"\n<b>Command: </b><code>{cmd}</code>"
-            msg += (
-                f"\n<b>Filters:-</b>\ninf: <code>{inf}</code>\nexf: <code>{exf}<code/>"
-            )
+            msg += f"\n<b>Filters:-</b>\ninf: <code>{inf}</code>\nexf: <code>{exf}</code>\n<b>sensitive: </b>{stv}"
             async with rss_dict_lock:
                 if rss_dict.get(user_id, False):
                     rss_dict[user_id][title] = {
@@ -150,6 +150,7 @@ async def rssSub(_, message, pre_event):
                         "exf": exf_lists,
                         "paused": False,
                         "command": cmd,
+                        "sensitive": stv,
                         "tag": tag,
                     }
                 else:
@@ -162,28 +163,29 @@ async def rssSub(_, message, pre_event):
                             "exf": exf_lists,
                             "paused": False,
                             "command": cmd,
+                            "sensitive": stv,
                             "tag": tag,
                         }
                     }
             LOGGER.info(
-                f"Rss Feed Added: id: {user_id} - title: {title} - link: {feed_link} - c: {cmd} - inf: {inf} - exf: {exf}"
+                f"Rss Feed Added: id: {user_id} - title: {title} - link: {feed_link} - c: {cmd} - inf: {inf} - exf: {exf} - stv {stv}"
             )
         except (IndexError, AttributeError) as e:
             emsg = f"The link: {feed_link} doesn't seem to be a RSS feed or it's region-blocked!"
             await sendMessage(message, emsg + "\nError: " + str(e))
         except Exception as e:
             await sendMessage(message, str(e))
-    if DATABASE_URL:
-        await DbManger().rss_update(user_id)
     if msg:
+        if DATABASE_URL and rss_dict[user_id]:
+            await DbManager().rss_update(user_id)
         await sendMessage(message, msg)
+        is_sudo = await CustomFilters.sudo("", message)
+        if scheduler.state == 2:
+            scheduler.resume()
+        elif is_sudo and not scheduler.running:
+            addJob()
+            scheduler.start()
     await updateRssMenu(pre_event)
-    is_sudo = await CustomFilters.sudo("", message)
-    if scheduler.state == 2:
-        scheduler.resume()
-    elif is_sudo and not scheduler.running:
-        addJob(config_dict["RSS_DELAY"])
-        scheduler.start()
 
 
 async def getUserId(title):
@@ -191,7 +193,7 @@ async def getUserId(title):
         return next(
             (
                 (True, user_id)
-                for user_id, feed in list(rss_dict.items())
+                for user_id, feed in rss_dict.items()
                 if feed["title"] == title
             ),
             (False, False),
@@ -229,23 +231,25 @@ async def rssUpdate(_, message, pre_event, state):
             if scheduler.state == 2:
                 scheduler.resume()
             elif is_sudo and not scheduler.running:
-                addJob(config_dict["RSS_DELAY"])
+                addJob()
                 scheduler.start()
         if is_sudo and DATABASE_URL and user_id != message.from_user.id:
-            await DbManger().rss_update(user_id)
+            await DbManager().rss_update(user_id)
         if not rss_dict[user_id]:
             async with rss_dict_lock:
                 del rss_dict[user_id]
             if DATABASE_URL:
-                await DbManger().rss_delete(user_id)
+                await DbManager().rss_delete(user_id)
                 if not rss_dict:
-                    await DbManger().trunc_table("rss")
-    LOGGER.info(f"Rss link with Title(s): {updated} has been {state}d!")
-    await sendMessage(
-        message, f"Rss links with Title(s): <code>{updated}</code> has been {state}d!"
-    )
-    if DATABASE_URL and rss_dict.get(user_id):
-        await DbManger().rss_update(user_id)
+                    await DbManager().trunc_table("rss")
+    if updated:
+        LOGGER.info(f"Rss link with Title(s): {updated} has been {state}d!")
+        await sendMessage(
+            message,
+            f"Rss links with Title(s): <code>{updated}</code> has been {state}d!",
+        )
+        if DATABASE_URL and rss_dict.get(user_id):
+            await DbManager().rss_update(user_id)
     await updateRssMenu(pre_event)
 
 
@@ -253,11 +257,11 @@ async def rssList(query, start, all_users=False):
     user_id = query.from_user.id
     buttons = ButtonMaker()
     if all_users:
-        list_feed = f"<b>All subscriptions | Page: {int(start/5)} </b>"
+        list_feed = f"<b>All subscriptions | Page: {int(start / 5)} </b>"
         async with rss_dict_lock:
-            keysCount = sum(len(v.keys()) for v in list(rss_dict.values()))
+            keysCount = sum(len(v.keys()) for v in rss_dict.values())
             index = 0
-            for titles in list(rss_dict.values()):
+            for titles in rss_dict.values():
                 for index, (title, data) in enumerate(
                     list(titles.items())[start : 5 + start]
                 ):
@@ -266,13 +270,14 @@ async def rssList(query, start, all_users=False):
                     list_feed += f"<b>Command:</b> <code>{data['command']}</code>\n"
                     list_feed += f"<b>Inf:</b> <code>{data['inf']}</code>\n"
                     list_feed += f"<b>Exf:</b> <code>{data['exf']}</code>\n"
+                    list_feed += f"<b>Sensitive:</b> <code>{data.get('sensitive', False)}</code>\n"
                     list_feed += f"<b>Paused:</b> <code>{data['paused']}</code>\n"
-                    list_feed += f"<b>User:</b> {data['tag'].lstrip('@')}"
+                    list_feed += f"<b>User:</b> {data['tag'].replace('@', '', 1)}"
                     index += 1
                     if index == 5:
                         break
     else:
-        list_feed = f"<b>Your subscriptions | Page: {int(start/5)} </b>"
+        list_feed = f"<b>Your subscriptions | Page: {int(start / 5)} </b>"
         async with rss_dict_lock:
             keysCount = len(rss_dict.get(user_id, {}).keys())
             for title, data in list(rss_dict[user_id].items())[start : 5 + start]:
@@ -280,12 +285,17 @@ async def rssList(query, start, all_users=False):
                 list_feed += f"<b>Command:</b> <code>{data['command']}</code>\n"
                 list_feed += f"<b>Inf:</b> <code>{data['inf']}</code>\n"
                 list_feed += f"<b>Exf:</b> <code>{data['exf']}</code>\n"
+                list_feed += (
+                    f"<b>Sensitive:</b> <code>{data.get('sensitive', False)}</code>\n"
+                )
                 list_feed += f"<b>Paused:</b> <code>{data['paused']}</code>\n"
     buttons.ibutton("Back", f"rss back {user_id}")
     buttons.ibutton("Close", f"rss close {user_id}")
     if keysCount > 5:
         for x in range(0, keysCount, 5):
-            buttons.ibutton(f"{int(x/5)}", f"rss list {user_id} {x}", position="footer")
+            buttons.ibutton(
+                f"{int(x / 5)}", f"rss list {user_id} {x}", position="footer"
+            )
     button = buttons.build_menu(2)
     if query.message.text.html == list_feed:
         return
@@ -312,9 +322,9 @@ async def rssGet(_, message, pre_event):
                 msg = await sendMessage(
                     message, f"Getting the last <b>{count}</b> item(s) from {title}"
                 )
-                async with ClientSession(trust_env=True) as session:
-                    async with session.get(data["link"]) as res:
-                        html = await res.text()
+                async with AsyncClient(verify=False) as client:
+                    res = await client.get(data["link"])
+                html = res.text
                 rss_d = feedparse(html)
                 item_info = ""
                 for item_num in range(count):
@@ -340,6 +350,8 @@ async def rssGet(_, message, pre_event):
             except Exception as e:
                 LOGGER.error(str(e))
                 await editMessage(msg, str(e))
+        else:
+            await sendMessage(message, "Enter a valid title. Title not found!")
     except Exception as e:
         LOGGER.error(str(e))
         await sendMessage(message, f"Enter a valid value!. {e}")
@@ -350,6 +362,7 @@ async def rssEdit(_, message, pre_event):
     user_id = message.from_user.id
     handler_dict[user_id] = False
     items = message.text.split("\n")
+    updated = False
     for item in items:
         args = item.split()
         title = args[0].strip()
@@ -362,15 +375,19 @@ async def rssEdit(_, message, pre_event):
         elif not rss_dict[user_id].get(title, False):
             await sendMessage(message, "Enter a valid title. Title not found!")
             continue
+        updated = True
         inf_lists = []
         exf_lists = []
-        arg = item.split(" -c ", 1)
-        cmd = re_split(" -inf | -exf ", arg[1])[0].strip() if len(arg) > 1 else None
-        arg = item.split(" -inf ", 1)
-        inf = re_split(" -c | -exf ", arg[1])[0].strip() if len(arg) > 1 else None
-        arg = item.split(" -exf ", 1)
-        exf = re_split(" -c | -inf ", arg[1])[0].strip() if len(arg) > 1 else None
+        arg_base = {"-c": None, "-inf": None, "-exf": None, "-stv": None}
+        arg_parser(args[1:], arg_base)
+        cmd = arg_base["-c"]
+        inf = arg_base["-inf"]
+        exf = arg_base["-exf"]
+        stv = arg_base["-stv"]
         async with rss_dict_lock:
+            if stv is not None:
+                stv = stv.lower() == "true"
+                rss_dict[user_id][title]["sensitive"] = stv
             if cmd is not None:
                 if cmd.lower() == "none":
                     cmd = None
@@ -389,8 +406,8 @@ async def rssEdit(_, message, pre_event):
                         y = x.split(" or ")
                         exf_lists.append(y)
                 rss_dict[user_id][title]["exf"] = exf_lists
-    if DATABASE_URL:
-        await DbManger().rss_update(user_id)
+    if DATABASE_URL and updated:
+        await DbManager().rss_update(user_id)
     await updateRssMenu(pre_event)
 
 
@@ -402,7 +419,7 @@ async def rssDelete(_, message, pre_event):
         async with rss_dict_lock:
             del rss_dict[user]
         if DATABASE_URL:
-            await DbManger().rss_delete(user)
+            await DbManager().rss_delete(user)
     await updateRssMenu(pre_event)
 
 
@@ -514,11 +531,11 @@ async def rssListener(client, query):
             button = buttons.build_menu(2)
             msg = """Send one or more rss titles with new filters or command separated by new line.
 Examples:
-Title1 -c mirror -up remote:path/subdir -exf none -inf 1080 or 720 opt: up: remote:path/subdir
-Title2 -c none -inf none -opt none
-Title3 -c mirror -rcf xxx -up xxx -z pswd
+Title1 -c mirror -up remote:path/subdir -exf none -inf 1080 or 720 -stv true
+Title2 -c none -inf none -stv false
+Title3 -c mirror -rcf xxx -up xxx -z pswd -stv false
 Note: Only what you provide will be edited, the rest will be the same like example 2: exf will stay same as it is.
-Timeout: 60 sec. Argument -c for command and options
+Timeout: 60 sec. Argument -c for command and arguments
             """
             await editMessage(message, msg, button)
             pfunc = partial(rssEdit, pre_event=query)
@@ -533,14 +550,14 @@ Timeout: 60 sec. Argument -c for command and options
             async with rss_dict_lock:
                 del rss_dict[int(data[2])]
             if DATABASE_URL:
-                await DbManger().rss_delete(int(data[2]))
+                await DbManager().rss_delete(int(data[2]))
             await updateRssMenu(query)
         elif data[1].endswith("pause"):
             async with rss_dict_lock:
                 for title in list(rss_dict[int(data[2])].keys()):
                     rss_dict[int(data[2])][title]["paused"] = True
             if DATABASE_URL:
-                await DbManger().rss_update(int(data[2]))
+                await DbManager().rss_update(int(data[2]))
         elif data[1].endswith("resume"):
             async with rss_dict_lock:
                 for title in list(rss_dict[int(data[2])].keys()):
@@ -548,7 +565,7 @@ Timeout: 60 sec. Argument -c for command and options
             if scheduler.state == 2:
                 scheduler.resume()
             if DATABASE_URL:
-                await DbManger().rss_update(int(data[2]))
+                await DbManager().rss_update(int(data[2]))
         await updateRssMenu(query)
     elif data[1].startswith("all"):
         if len(rss_dict) == 0:
@@ -559,7 +576,7 @@ Timeout: 60 sec. Argument -c for command and options
             async with rss_dict_lock:
                 rss_dict.clear()
             if DATABASE_URL:
-                await DbManger().trunc_table("rss")
+                await DbManager().trunc_table("rss")
             await updateRssMenu(query)
         elif data[1].endswith("pause"):
             async with rss_dict_lock:
@@ -569,7 +586,7 @@ Timeout: 60 sec. Argument -c for command and options
             if scheduler.running:
                 scheduler.pause()
             if DATABASE_URL:
-                await DbManger().rss_update_all()
+                await DbManager().rss_update_all()
         elif data[1].endswith("resume"):
             async with rss_dict_lock:
                 for user in list(rss_dict.keys()):
@@ -578,10 +595,10 @@ Timeout: 60 sec. Argument -c for command and options
             if scheduler.state == 2:
                 scheduler.resume()
             elif not scheduler.running:
-                addJob(config_dict["RSS_DELAY"])
+                addJob()
                 scheduler.start()
             if DATABASE_URL:
-                await DbManger().rss_update_all()
+                await DbManager().rss_update_all()
     elif data[1] == "deluser":
         if len(rss_dict) == 0:
             await query.answer(text="No subscriptions!", show_alert=True)
@@ -613,7 +630,7 @@ Timeout: 60 sec. Argument -c for command and options
     elif data[1] == "start":
         if not scheduler.running:
             await query.answer()
-            addJob(config_dict["RSS_DELAY"])
+            addJob()
             scheduler.start()
             await updateRssMenu(query)
         else:
@@ -630,13 +647,22 @@ async def rssMonitor():
         return
     all_paused = True
     for user, items in list(rss_dict.items()):
-        for title, data in list(items.items()):
+        for title, data in items.items():
             try:
                 if data["paused"]:
                     continue
-                async with ClientSession(trust_env=True) as session:
-                    async with session.get(data["link"]) as res:
-                        html = await res.text()
+                tries = 0
+                while True:
+                    try:
+                        async with AsyncClient(verify=False) as client:
+                            res = await client.get(data["link"])
+                        html = res.text
+                        break
+                    except Exception:
+                        tries += 1
+                        if tries > 3:
+                            raise
+                        continue
                 rss_d = feedparse(html)
                 try:
                     last_link = rss_d.entries[0]["links"][1]["href"]
@@ -651,7 +677,7 @@ async def rssMonitor():
                 while True:
                     try:
                         await sleep(10)
-                    except:
+                    except Exception:
                         raise RssShutdownException("Rss Monitor Stopped!")
                     try:
                         item_title = rss_d.entries[feed_count]["title"]
@@ -668,12 +694,26 @@ async def rssMonitor():
                         break
                     parse = True
                     for flist in data["inf"]:
-                        if all(x not in item_title.lower() for x in flist):
+                        if (
+                            data.get("sensitive", False)
+                            and all(x.lower() not in item_title.lower() for x in flist)
+                        ) or (
+                            not data.get("sensitive", False)
+                            and all(x not in item_title for x in flist)
+                        ):
                             parse = False
                             feed_count += 1
                             break
+                    if not parse:
+                        continue
                     for flist in data["exf"]:
-                        if any(x in item_title.lower() for x in flist):
+                        if (
+                            data.get("sensitive", False)
+                            and any(x.lower() in item_title.lower() for x in flist)
+                        ) or (
+                            data.get("sensitive", False)
+                            and any(x in item_title for x in flist)
+                        ):
                             parse = False
                             feed_count += 1
                             break
@@ -699,7 +739,7 @@ async def rssMonitor():
                     rss_dict[user][title].update(
                         {"last_feed": last_link, "last_title": last_title}
                     )
-                await DbManger().rss_update(user)
+                await DbManager().rss_update(user)
                 LOGGER.info(f"Feed Name: {title}")
                 LOGGER.info(f"Last item: {last_link}")
             except RssShutdownException as ex:
@@ -712,10 +752,10 @@ async def rssMonitor():
         scheduler.pause()
 
 
-def addJob(delay):
+def addJob():
     scheduler.add_job(
         rssMonitor,
-        trigger=IntervalTrigger(seconds=delay),
+        trigger=IntervalTrigger(seconds=config_dict["RSS_DELAY"]),
         id="0",
         name="RSS",
         misfire_grace_time=15,
@@ -725,7 +765,7 @@ def addJob(delay):
     )
 
 
-addJob(config_dict["RSS_DELAY"])
+addJob()
 scheduler.start()
 bot.add_handler(
     MessageHandler(
