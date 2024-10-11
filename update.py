@@ -1,3 +1,4 @@
+from sys import exit
 from dotenv import load_dotenv, dotenv_values
 from logging import (
     FileHandler,
@@ -35,7 +36,7 @@ try:
     if bool(environ.get("_____REMOVE_THIS_LINE_____")):
         log_error("The README.md file there to be read! Exiting now!")
         exit(1)
-except Exception:
+except:
     pass
 
 BOT_TOKEN = environ.get("BOT_TOKEN", "")
@@ -43,7 +44,7 @@ if len(BOT_TOKEN) == 0:
     log_error("BOT_TOKEN variable is missing! Exiting now")
     exit(1)
 
-bot_id = BOT_TOKEN.split(":", 1)[0]
+BOT_ID = BOT_TOKEN.split(":", 1)[0]
 
 DATABASE_URL = environ.get("DATABASE_URL", "")
 if len(DATABASE_URL) == 0:
@@ -53,8 +54,8 @@ if DATABASE_URL is not None:
     try:
         conn = MongoClient(DATABASE_URL, server_api=ServerApi("1"))
         db = conn.mltb
-        old_config = db.settings.deployConfig.find_one({"_id": bot_id})
-        config_dict = db.settings.config.find_one({"_id": bot_id})
+        old_config = db.settings.deployConfig.find_one({"_id": BOT_ID})
+        config_dict = db.settings.config.find_one({"_id": BOT_ID})
         if old_config is not None:
             del old_config["_id"]
         if (
